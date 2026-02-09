@@ -1,0 +1,137 @@
+// CLASIFICADOR EMG - LÓGICA DE ESCALERA + RESTA DE BASE
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>      
+#include <cstdint>     
+#include "pico/stdlib.h"
+#include "hardware/adc.h"
+#include "hardware/gpio.h"
+#include <vector>
+#include <numeric>
+
+// --- CONFIGURACIÓN ---
+#define ADC_PIN 26          
+#define ADC_CHANNEL 0       
+#define SAMPLING_PERIOD_US 1000 
+#define WINDOW_SIZE 200     
+
+const uint LED_PINS[5] = {16, 17, 18, 19, 20};
+
+// UMBRALES DE ENERGIA
+const float UMBRAL_NIVEL_2 = 190.0f;  // Arriba de esto es Tensión Ligera
+const float UMBRAL_NIVEL_3 = 500.0f;  // Arriba de esto es Fuerza Media
+const float UMBRAL_NIVEL_4 = 850.0f;  // Arriba de esto es Fuerza Alta
+const float UMBRAL_NIVEL_5 = 1800.0f; // Arriba de esto es Fuerza Extrema
+
+std::vector<float> buffer_lecturas;
+
+// --- FUNCIÓN DE VOTACIÓN (Para estabilidad de LEDs) ---
+void encender_led_estable(int movimiento) {
+    static int historial[10] = {0}; 
+    static int indice = 0;
+    
+    // Guardar en historial circular
+    historial[indice] = movimiento;
+    indice = (indice + 1) % 10;
+
+    // Contar votos
+    int votos[5] = {0, 0, 0, 0, 0};
+    for(int i=0; i<10; i++) {
+        if(historial[i] >= 0 && historial[i] < 5) votos[historial[i]]++;
+    }
+
+    // Buscar ganador
+    int ganador = -1;
+    int max_votos = 0;
+    for(int i=0; i<5; i++) {
+        if(votos[i] > max_votos) {
+            max_votos = votos[i];
+            ganador = i;
+        }
+    }
+
+    // Solo cambiar si hay mayoría clara (4 de 10 votos)
+    if (ganador != -1 && max_votos >= 4) {
+        for(int i=0; i<5; i++) gpio_put(LED_PINS[i], 0); // Apagar todos
+        gpio_put(LED_PINS[ganador], 1); // Encender ganador
+    }
+}
+
+int main() {
+    stdio_init_all();
+    adc_init();
+    adc_gpio_init(ADC_PIN);
+    adc_select_input(ADC_CHANNEL);
+
+    // Iniciar LEDs
+    for(int i=0; i<5; i++) {
+        gpio_init(LED_PINS[i]);
+        gpio_set_dir(LED_PINS[i], GPIO_OUT);
+    }
+
+    // Blink de bienvenida 
+    for(int i=0; i<3; i++) {
+        gpio_put(LED_PINS[2], 1); sleep_ms(100);
+        gpio_put(LED_PINS[2], 0); sleep_ms(100);
+    }
+
+    uint64_t last_sample_time = time_us_64();
+
+    while (true) {
+        uint64_t current_time = time_us_64();
+
+        // Control de tiempo exacto (1ms)
+        if (current_time - last_sample_time >= SAMPLING_PERIOD_US) {
+            last_sample_time += SAMPLING_PERIOD_US;
+
+            // 1. LEER Y AMPLIFICAR
+            uint16_t raw = adc_read();
+            // Multiplicamos x15 para que la señal del AD8232 tenga fuerza
+            float lectura = (float)raw * 15.0f; 
+
+            // 2. LLENAR BUFFER (Ventana Móvil)
+            if (buffer_lecturas.size() >= WINDOW_SIZE) {
+                buffer_lecturas.erase(buffer_lecturas.begin()); // Borrar el dato más viejo
+            }
+            buffer_lecturas.push_back(lectura); // Meter el dato nuevo
+
+            // 3. PROCESAR (Solo si el buffer está lleno)
+            if (buffer_lecturas.size() == WINDOW_SIZE) {
+                
+
+                float suma_total = 0;
+                for(float val : buffer_lecturas) suma_total += val;
+                float linea_base = suma_total / WINDOW_SIZE;
+
+
+                float suma_diferencias = 0;
+                for(float val : buffer_lecturas) {
+                    suma_diferencias += fabsf(val - linea_base); 
+                }
+                float energia_promedio = suma_diferencias / WINDOW_SIZE;
+
+                int clase_detectada = 0;
+
+                if (energia_promedio > UMBRAL_NIVEL_5) {
+                    clase_detectada = 2; // Movimiento 3 (Fuerza Extrema) - LED GP18
+                } else if (energia_promedio > UMBRAL_NIVEL_4) {
+                    clase_detectada = 1; // Movimiento 2 (Fuerza Alta) - LED GP17
+                } else if (energia_promedio > UMBRAL_NIVEL_3) {
+                    clase_detectada = 3; // Movimiento 4 (Fuerza Media) - LED GP19
+                } else if (energia_promedio > UMBRAL_NIVEL_2) {
+                    clase_detectada = 4; // Movimiento 5 (Tensión Ligera) - LED GP20
+                } else {
+                    clase_detectada = 0; // Movimiento 1 (Reposo) - LED GP16
+                }
+
+                // 5. DEBUG (Opcional: Descomenta para ver los números en el monitor)
+                printf("Energia Real: %.0f | LED: %d\n", energia_promedio, clase_detectada + 1);
+                
+                // 6. ACTUAR
+                encender_led_estable(clase_detectada);
+            }
+        }
+    }
+    return 0;
+}
